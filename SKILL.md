@@ -1,10 +1,10 @@
 ---
-name: claude-norms-update
+name: claude-summarize
 description: >
-  Extract development norms from Claude Code chat history, analyze against CLAUDE.md,
-  auto-append new rules. Cross-session learning. Use when user says "提炼规范",
-  "更新 CLAUDE.md", "回顾聊天记录", "总结开发规范", "auto-update claude.md",
-  "从聊天中学习".
+  从 Claude Code 聊天记录中提取开发规范，比对 CLAUDE.md 自动追加新规则。
+  跨会话学习。用户说"提炼规范"、"更新 CLAUDE.md"、"回顾聊天记录"、
+  "总结开发规范"、"auto-update claude.md"、"cross-session learning"、
+  "/norms"、"规范总结"时触发。
 ---
 
 从 Claude Code 聊天记录中提取开发规范，比对更新 CLAUDE.md。
@@ -12,7 +12,7 @@ description: >
 ## 触发
 
 用户说"提炼规范"、"更新 CLAUDE.md"、"回顾聊天"、"总结规范"、
-"cross-session learning"、"/norms" 时触发。
+"cross-session learning"、"/norms"、"claude-summarize" 时触发。
 
 ## 流程
 
