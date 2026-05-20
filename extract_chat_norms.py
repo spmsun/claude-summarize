@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-Extract and analyze development norms from Claude Code chat logs.
+Extract development-norm candidates from Claude Code chat logs.
 
-Scans JSONL chat logs, filters noise, groups similar messages (clustering),
-scores "norm signal strength", and outputs a structured digest for LLM analysis.
-
-Usage:
-    python3 extract_chat_norms.py <project_dir>
-    python3 extract_chat_norms.py <project_dir> --min-length 20  --max-length 500
+Scans JSONL chat logs, filters noise, groups near-duplicate messages via
+Jaccard clustering, and outputs a structured digest for LLM classification.
+The script handles extraction / dedup / clustering only — semantic judgment
+(signal type, priority, whether it's actually a norm) is left to the LLM.
 
 Output:
-    <project_dir>/.norm_digest.md        — structured norm analysis digest
-    <project_dir>/.norm_extractor_state.json  — incremental processing state
-
-Features:
-    - Near-duplicate clustering via Jaccard similarity (no external deps)
-    - Signal strength scoring (correction / principle / feedback / task / question)
-    - Cross-session tracking (how many sessions raised similar concerns)
-    - Incremental processing (state file tracks what was already seen)
+    <project_dir>/.norm_digest.md            — structured norm analysis digest
+    <project_dir>/.norm_extractor_state.json — incremental processing state
 """
 
 import argparse
@@ -25,7 +17,7 @@ import json
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Tuple
 
@@ -37,14 +29,11 @@ _XML_TAG = re.compile(r"<[^>]+>")
 _ANSI_ESC = re.compile(r"\x1b\[[0-9;]*m")
 
 _STOP_WORDS = {
+    # ZH
     "继续",
     "好的",
     "嗯",
     "好",
-    "ok",
-    "hello",
-    "hi",
-    "hey",
     "是的",
     "对",
     "可以",
@@ -54,22 +43,36 @@ _STOP_WORDS = {
     "了解",
     "收到",
     "谢谢",
-    "thanks",
-    "thx",
     "请继续",
-    "go on",
-    "go ahead",
-    "yes",
-    "no",
-    "对。",
-    "好。",
-    "行。",
     "开始吧",
     "来吧",
     "搞",
     "干",
     "做吧",
     "动手吧",
+    "对。",
+    "好。",
+    "行。",
+    # EN
+    "ok",
+    "okay",
+    "hello",
+    "hi",
+    "hey",
+    "thanks",
+    "thx",
+    "go on",
+    "go ahead",
+    "yes",
+    "no",
+    "yep",
+    "nope",
+    "sure",
+    "got it",
+    "nice",
+    "cool",
+    "great",
+    "awesome",
 }
 
 _SYSTEM_PREFIXES = (
@@ -105,14 +108,12 @@ _MAX_LENGTH = 2000
 
 
 def strip_envelope(text: str) -> str:
-    """Remove ANSI escapes and XML tags."""
     t = _ANSI_ESC.sub("", text)
     t = _XML_TAG.sub("", t)
     return t.strip()
 
 
 def is_garbage(text: str) -> bool:
-    """Return True if this text should be excluded from analysis."""
     t = " ".join(text.split()).strip()
     if not t:
         return True
@@ -130,7 +131,6 @@ def is_garbage(text: str) -> bool:
         return True
     if re.match(r"^[a-f0-9]{12,} call_", t):
         return True
-    # Empty local-command output indicator
     if re.match(r"^\(.+ completed with no output\)$", t):
         return True
     if len(t) < _MIN_LENGTH:
@@ -145,187 +145,17 @@ def has_system_tag(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Classification / signal scoring
-# ---------------------------------------------------------------------------
-
-# Patterns that indicate different types of norm signals
-# Each: (label, weight, keyword_list)
-_SIGNAL_PATTERNS = [
-    (
-        "CORRECTION",
-        3.0,
-        [
-            "不要",
-            "不对",
-            "错了",
-            "应该是",
-            "不是",
-            "而非",
-            "不应该",
-            "别用",
-            "别这么",
-            "不能这样",
-            "禁止",
-        ],
-    ),
-    (
-        "PRINCIPLE",
-        2.5,
-        [
-            "必须",
-            "记住",
-            "以后",
-            "规范是",
-            "原则是",
-            "一律",
-            "统一",
-            "不得",
-            "须",
-            "严禁",
-            "不准",
-            "只能",
-        ],
-    ),
-    (
-        "FEEDBACK",
-        2.0,
-        [
-            "问题",
-            "bug",
-            "错误",
-            "失败",
-            "注意",
-            "修复",
-            "改一下",
-            "重写",
-            "优化",
-            "漏洞",
-        ],
-    ),
-    (
-        "PATTERN",
-        1.8,
-        [
-            "按规范",
-            "按照",
-            "模式",
-            "套路",
-            "惯例",
-            "标准",
-            "常规",
-            "推荐",
-            "建议",
-        ],
-    ),
-    (
-        "REPETITION",
-        1.5,
-        [
-            "又",
-            "再次",
-            "还是",
-            "仍然",
-            "依然",
-            "重复",
-            "多次",
-            "仍然不",
-        ],
-    ),
-    (
-        "YAGNI",
-        1.5,
-        [
-            "过度",
-            "多余",
-            "没必要",
-            "不需要",
-            "不用",
-            "精简",
-            "简化",
-            "过度设计",
-            "嵌套",
-        ],
-    ),
-    (
-        "TASK",
-        1.0,
-        [
-            "运行",
-            "执行",
-            "检查",
-            "审查",
-            "测试",
-            "对比",
-            "实现",
-            "开发",
-            "创建",
-            "迁移",
-        ],
-    ),
-    (
-        "QUESTION",
-        0.5,
-        [
-            "为什么",
-            "什么",
-            "怎么",
-            "如何",
-            "吗？",
-            "？",
-            "是不是",
-            "能不能",
-            "是否",
-        ],
-    ),
-]
-
-
-def classify_text(text: str) -> List[Tuple[str, float]]:
-    """Return list of (signal_type, weight) for all matched patterns."""
-    results = []
-    low = text.lower()
-    for label, weight, keywords in _SIGNAL_PATTERNS:
-        for kw in keywords:
-            if kw in text or kw in low:
-                results.append((label, weight))
-                break  # one match per category is enough
-    if not results:
-        results.append(("GENERIC", 0.3))
-    return results
-
-
-def compute_signal_score(text: str) -> float:
-    """Aggregate signal score from all matched patterns."""
-    tags = classify_text(text)
-    # Boost for multiple signal types
-    unique_types = len(set(t[0] for t in tags))
-    score = sum(w for _, w in tags)
-    if unique_types >= 3:
-        score *= 1.3
-    return round(score, 1)
-
-
-def best_label(text: str) -> str:
-    """Return the strongest applicable label for display."""
-    tags = classify_text(text)
-    if not tags:
-        return "GENERIC"
-    return max(tags, key=lambda x: x[1])[0]
-
-
-# ---------------------------------------------------------------------------
-# Near-duplicate detection (Jaccard word-set similarity)
+# Jaccard clustering — groups near-duplicate messages across sessions
 # ---------------------------------------------------------------------------
 
 
 def _word_set(text: str) -> set:
-    """Tokenize into word set, dropping very short tokens."""
-    t = re.sub(r"[^\w一-鿿]", " ", text.lower())
+    """Tokenize into word set — CJK ranges included for mixed-language text."""
+    t = re.sub(r"[^\w一-鿿㐀-䶿]", " ", text.lower())
     return {w for w in t.split() if len(w) > 1}
 
 
 def jaccard_similarity(a: str, b: str) -> float:
-    """Jaccard similarity of word sets between two texts."""
     sa, sb = _word_set(a), _word_set(b)
     if not sa or not sb:
         return 0.0
@@ -333,7 +163,9 @@ def jaccard_similarity(a: str, b: str) -> float:
 
 
 def cluster_messages(messages: List[str], threshold: float = 0.45) -> List[List[str]]:
-    """Group messages into clusters by word-set similarity (graph-based)."""
+    """Group messages into clusters by Jaccard similarity (union-find).
+    n is typically < 200, so O(n²) is acceptable.
+    """
     n = len(messages)
     parent = list(range(n))
 
@@ -348,7 +180,6 @@ def cluster_messages(messages: List[str], threshold: float = 0.45) -> List[List[
         if ra != rb:
             parent[rb] = ra
 
-    # Compare each pair (n is typically < 200, so O(n²) is fine)
     for i in range(n):
         for j in range(i + 1, n):
             if jaccard_similarity(messages[i], messages[j]) >= threshold:
@@ -358,7 +189,6 @@ def cluster_messages(messages: List[str], threshold: float = 0.45) -> List[List[
     for idx, m in enumerate(messages):
         clusters[find(idx)].append(m)
 
-    # Return clusters sorted by size (largest first)
     return sorted(clusters.values(), key=len, reverse=True)
 
 
@@ -368,9 +198,7 @@ def cluster_messages(messages: List[str], threshold: float = 0.45) -> List[List[
 
 
 def extract_from_file(filepath: Path) -> List[Tuple[str, str, str]]:
-    """
-    Extract user messages from a JSONL file.
-
+    """Extract user messages from a JSONL file.
     Returns list of (text, session_id, git_branch).
     """
     entries = []
@@ -427,13 +255,8 @@ def save_state(state_file: Path, now: datetime):
 
 
 # ---------------------------------------------------------------------------
-# Digest output
+# Digest output — clusters first (highest signal), then full-text listing
 # ---------------------------------------------------------------------------
-
-
-def escape_md(text: str) -> str:
-    """Escape markdown special chars in text for safe inclusion."""
-    return text.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`")
 
 
 def write_digest(
@@ -442,23 +265,16 @@ def write_digest(
     messages: List[Tuple[str, str, str]],
     cluster_threshold: float = 0.45,
 ):
-    """
-    Write structured digest:
-    - Summary stats
-    - Hot topics (clusters with 2+ messages)
-    - Per-message listing with signal tags and cross-session info
-    """
     if not messages:
         with open(digest_file, "w") as f:
             f.write(f"# Chat Norms Digest — {now.strftime('%Y-%m-%d %H:%M')}\n\n")
-            f.write("_没有新的消息需要分析。_\n")
+            f.write("_No new messages to analyze._\n")
         return
 
-    # Count sessions
     session_ids = set(sid for _, sid, _ in messages)
     texts = [t for t, _, _ in messages]
 
-    # Build cross-session tracking
+    # Cross-session tracking
     text_to_sessions = defaultdict(set)
     for t, sid, _ in messages:
         text_to_sessions[t].add(sid)
@@ -466,9 +282,9 @@ def write_digest(
     # Cluster
     clusters = cluster_messages(texts, threshold=cluster_threshold)
 
-    # Score each message
-    scored = [(compute_signal_score(t), t, text_to_sessions[t]) for t in texts]
-    scored.sort(key=lambda x: -x[0])  # highest signal first
+    # Sort singletons (clusters of size 1) by cross-session count
+    singletons = [c[0] for c in clusters if len(c) == 1]
+    singletons.sort(key=lambda t: -len(text_to_sessions[t]))
 
     with open(digest_file, "w") as f:
         f.write(f"# Chat Norms Digest — {now.strftime('%Y-%m-%d %H:%M')}\n\n")
@@ -476,44 +292,57 @@ def write_digest(
             f"**{len(texts)}** unique messages from **{len(session_ids)}** sessions\n\n"
         )
 
-        # --- Hot topic clusters ---
+        # --- Hot Topic Clusters (2+ messages) ---
         multi_clusters = [c for c in clusters if len(c) >= 2]
         if multi_clusters:
-            f.write("##  热点聚类\n\n")
+            f.write("## Hot Topic Clusters\n\n")
             f.write(
-                "_以下为语义相似的消息分组，同一组说明用户在多处表达了相似诉求。_\n\n"
+                "_These semantically-similar messages appeared across multiple places. "
+                "The user likely emphasized the same concern repeatedly — "
+                "high-priority norm candidates._\n\n"
             )
             for ci, cluster in enumerate(multi_clusters, 1):
-                avg_score = sum(compute_signal_score(m) for m in cluster) / len(cluster)
-                f.write(
-                    f"### 聚类 {ci}（{len(cluster)} 条，平均信号强度 {avg_score:.1f}）\n\n"
-                )
+                f.write(f"### Cluster {ci} ({len(cluster)} messages)\n\n")
                 for m in cluster:
                     sessions = text_to_sessions[m]
-                    ss = f"横跨 {len(sessions)} 个会话" if len(sessions) > 1 else ""
-                    f.write(f"- {escape_md(m)}{' — ' + ss if ss else ''}\n")
+                    ss = (
+                        f" [across {len(sessions)} sessions]"
+                        if len(sessions) > 1
+                        else ""
+                    )
+                    f.write(f"- {_escape_md(m)}{ss}\n")
                 f.write("\n")
 
-        # --- Detailed listing (signal-ranked) ---
-        f.write("##  消息明细（按信号强度排序）\n\n")
-        f.write("| # | 信号 | 强度 | 消息 | 会话数 |\n")
-        f.write("|---|------|------|------|--------|\n")
-        for i, (score, t, sessions) in enumerate(scored, 1):
-            label = best_label(t)
-            sess_cnt = len(sessions)
-            # Truncate very long messages in table
-            display_t = t[:120] + "…" if len(t) > 120 else t
-            display_t = escape_md(display_t)
-            f.write(f"| {i} | {label} | {score} | {display_t} | {sess_cnt} |\n")
+        # --- Singletons, sorted by cross-session count ---
+        if singletons:
+            f.write("## All Messages\n\n")
+            f.write(
+                "_Single-occurrence messages, sorted by cross-session frequency._\n\n"
+            )
+            for t in singletons:
+                sessions = text_to_sessions[t]
+                ss = f" [across {len(sessions)} sessions]" if len(sessions) > 1 else ""
+                f.write(f"- {_escape_md(t)}{ss}\n")
+            f.write("\n")
 
-        # --- Full text listing for LLM consumption ---
-        f.write("\n---\n\n")
-        f.write("## 完整消息正文\n\n")
-        for i, (score, t, sessions) in enumerate(scored, 1):
-            label = best_label(t)
-            sess_info = f" [跨 {len(sessions)} 会话]" if len(sessions) > 1 else ""
-            f.write(f"**{i}.** `[{label}]` `[强度 {score}]`{sess_info} ")
-            f.write(f"{t}\n\n")
+        # --- Full text for LLM analysis ---
+        f.write("---\n\n")
+        f.write("## Full Message Text\n\n")
+        f.write(
+            "_Analyze each message below. Classify by signal type: CORRECTION, "
+            "PRINCIPLE, FEEDBACK, PATTERN, REPETITION, YAGNI, TASK, QUESTION. "
+            "Skip messages that are unrelated to coding norms. "
+            "For each norm candidate, extract a concise rule and decide whether "
+            "it belongs in global CLAUDE.md or project CLAUDE.md._\n\n"
+        )
+        for i, (t, _, _) in enumerate(messages, 1):
+            sessions = text_to_sessions[t]
+            ss = f" [across {len(sessions)} sessions]" if len(sessions) > 1 else ""
+            f.write(f"**{i}.**{ss}\n\n{t}\n\n")
+
+
+def _escape_md(text: str) -> str:
+    return text.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`")
 
 
 # ---------------------------------------------------------------------------
@@ -523,10 +352,11 @@ def write_digest(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract and analyze development norms from Claude Code chat logs."
+        description="Extract development-norm candidates from Claude Code chat logs."
     )
     parser.add_argument(
-        "project_dir", help="Project directory (contains .claude/projects/<slug>/)"
+        "project_dir",
+        help="Project directory (chat logs expected at ~/.claude/projects/<slug>/)",
     )
     parser.add_argument(
         "--min-length",
@@ -544,16 +374,19 @@ def main():
         "--cluster-threshold",
         type=float,
         default=0.45,
-        help="Jaccard similarity threshold for clustering (0-1, default: 0.45)",
+        help="Jaccard similarity threshold for clustering (0–1, default: 0.45)",
     )
     parser.add_argument(
         "--days",
         type=int,
         default=0,
-        help="仅处理最近 N 天内的对话（0=不限制，建议定时运行时设 7/14/30）",
+        help="Only process conversations from the last N days (0 = unlimited; 7/14/30 for cron)",
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Print progress to stderr"
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Print progress to stderr",
     )
     args = parser.parse_args()
 
@@ -562,7 +395,6 @@ def main():
         print(f"Error: not a directory: {project}", file=sys.stderr)
         sys.exit(1)
 
-    # Derive logs dir from project path: $HOME/.claude/projects/<slug>
     slug = str(project).replace("/", "-")
     logs_dir = Path.home() / ".claude/projects" / slug
     state_file = project / ".norm_extractor_state.json"
@@ -573,9 +405,6 @@ def main():
         tzinfo=timezone.utc
     )
     now = datetime.now(timezone.utc)
-
-    # 如果指定了 --days，计算时间窗口下限
-    from datetime import timedelta
 
     days_cutoff = None
     if args.days > 0:
@@ -605,7 +434,6 @@ def main():
         if entries:
             all_msgs.extend(entries)
 
-    # Deduplicate by exact text (keep first occurrence's session/branch info)
     seen_texts = set()
     unique_msgs = []
     for text, sid, branch in all_msgs:
