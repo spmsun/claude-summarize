@@ -23,6 +23,7 @@ python3 {baseDir}/extract_chat_norms.py <project_dir>
 ```
 
 可选参数：
+- `--days 7` — 仅处理最近 N 天内对话（0=不限制，定时运行建议设 7/14/30）
 - `--cluster-threshold 0.45` — Jaccard 相似度聚类阈值（0~1，默认 0.45）
 - `--min-length 20` — 最小消息长度（默认 15）
 - `--max-length 1000` — 最大消息长度（默认 2000）

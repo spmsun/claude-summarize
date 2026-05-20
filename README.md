@@ -68,6 +68,7 @@ python3 extract_chat_norms.py /path/to/your/project -v
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `project_dir` | — | 项目目录路径 |
+| `--days` | 0 | 仅处理最近 N 天内对话（0=不限制，定时运行建议 7/14/30） |
 | `--cluster-threshold` | 0.45 | Jaccard 聚类阈值（0~1） |
 | `--min-length` | 15 | 最小消息长度 |
 | `--max-length` | 2000 | 最大消息长度 |

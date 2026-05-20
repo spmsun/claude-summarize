@@ -547,6 +547,12 @@ def main():
         help="Jaccard similarity threshold for clustering (0-1, default: 0.45)",
     )
     parser.add_argument(
+        "--days",
+        type=int,
+        default=0,
+        help="仅处理最近 N 天内的对话（0=不限制，建议定时运行时设 7/14/30）",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Print progress to stderr"
     )
     args = parser.parse_args()
@@ -568,11 +574,20 @@ def main():
     )
     now = datetime.now(timezone.utc)
 
+    # 如果指定了 --days，计算时间窗口下限
+    from datetime import timedelta
+
+    days_cutoff = None
+    if args.days > 0:
+        days_cutoff = now - timedelta(days=args.days)
+
     new_files = []
     if logs_dir.exists():
         for f in sorted(logs_dir.glob("*.jsonl")):
             mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
             if mtime > last_ts:
+                if days_cutoff is not None and mtime < days_cutoff:
+                    continue
                 new_files.append(f)
 
     if not new_files:
