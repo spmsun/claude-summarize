@@ -3,9 +3,10 @@
 Extract development-norm candidates from Claude Code chat logs.
 
 Scans JSONL chat logs, filters noise, groups near-duplicate messages via
-Jaccard clustering, and outputs a structured digest for LLM classification.
-The script handles extraction / dedup / clustering only — semantic judgment
-(signal type, priority, whether it's actually a norm) is left to the LLM.
+Jaccard or embedding-based clustering, and outputs a structured digest for
+LLM classification.  The script handles extraction / dedup / clustering only —
+semantic judgment (signal type, priority, whether it's actually a norm) is
+left to the LLM.
 
 Output:
     <project_dir>/.norm_digest.md            — structured norm analysis digest
@@ -193,6 +194,62 @@ def cluster_messages(messages: List[str], threshold: float = 0.45) -> List[List[
 
 
 # ---------------------------------------------------------------------------
+# Embedding-based clustering — cross-language aware (optional, lazy import)
+# ---------------------------------------------------------------------------
+
+
+def cluster_messages_embedding(
+    messages: List[str], threshold: float = 0.45
+) -> List[List[str]]:
+    """Group messages into clusters by cosine similarity of sentence embeddings.
+
+    Uses ``all-MiniLM-L6-v2`` from sentence-transformers — same interface as
+    ``cluster_messages()`` so the caller can swap engines transparently.
+
+    sentence-transformers is imported lazily; the caller MUST ensure it is
+    available before calling this function.
+    """
+    # Lazy imports — hard dependency only when this code path is taken.
+    import numpy as np
+    from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(messages)
+
+    # L2-normalize so dot product equals cosine similarity.
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0  # guard against zero vectors
+    embeddings = embeddings / norms
+
+    sim_matrix = np.dot(embeddings, embeddings.T)
+
+    n = len(messages)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if sim_matrix[i][j] >= threshold:
+                union(i, j)
+
+    clusters = defaultdict(list)
+    for idx, m in enumerate(messages):
+        clusters[find(idx)].append(m)
+
+    return sorted(clusters.values(), key=len, reverse=True)
+
+
+# ---------------------------------------------------------------------------
 # JSONL extraction
 # ---------------------------------------------------------------------------
 
@@ -264,10 +321,14 @@ def write_digest(
     now: datetime,
     messages: List[Tuple[str, str, str]],
     cluster_threshold: float = 0.45,
+    cluster_engine: str = "jaccard",
+    auto: bool = False,
 ):
     if not messages:
         with open(digest_file, "w") as f:
             f.write(f"# Chat Norms Digest — {now.strftime('%Y-%m-%d %H:%M')}\n\n")
+            if auto:
+                f.write("> AUTO\n\n")
             f.write("_No new messages to analyze._\n")
         return
 
@@ -279,8 +340,11 @@ def write_digest(
     for t, sid, _ in messages:
         text_to_sessions[t].add(sid)
 
-    # Cluster
-    clusters = cluster_messages(texts, threshold=cluster_threshold)
+    # Cluster — choose engine
+    if cluster_engine == "embedding":
+        clusters = cluster_messages_embedding(texts, threshold=cluster_threshold)
+    else:
+        clusters = cluster_messages(texts, threshold=cluster_threshold)
 
     # Sort singletons (clusters of size 1) by cross-session count
     singletons = [c[0] for c in clusters if len(c) == 1]
@@ -288,9 +352,26 @@ def write_digest(
 
     with open(digest_file, "w") as f:
         f.write(f"# Chat Norms Digest — {now.strftime('%Y-%m-%d %H:%M')}\n\n")
+
+        if auto:
+            f.write("> AUTO\n\n")
+
         f.write(
-            f"**{len(texts)}** unique messages from **{len(session_ids)}** sessions\n\n"
+            f"**{len(texts)}** unique messages from **{len(session_ids)}** sessions\n"
         )
+        if cluster_engine == "embedding":
+            f.write("\n_Clustered via embedding cosine similarity._\n")
+        f.write("\n")
+
+        # --- Auto-mode instruction block ---
+        if auto:
+            f.write(
+                "> **AUTO MODE** — Proceed through all analysis, refinement, and "
+                "update steps without pausing for confirmation. Classify every "
+                "message, extract norm candidates, decide placement "
+                "(global CLAUDE.md vs project CLAUDE.md), and apply the updates. "
+                "Do not stop to ask — process the full digest in one pass.\n\n"
+            )
 
         # --- Hot Topic Clusters (2+ messages) ---
         multi_clusters = [c for c in clusters if len(c) >= 2]
@@ -328,13 +409,25 @@ def write_digest(
         # --- Full text for LLM analysis ---
         f.write("---\n\n")
         f.write("## Full Message Text\n\n")
-        f.write(
-            "_Analyze each message below. Classify by signal type: CORRECTION, "
-            "PRINCIPLE, FEEDBACK, PATTERN, REPETITION, YAGNI, TASK, QUESTION. "
-            "Skip messages that are unrelated to coding norms. "
-            "For each norm candidate, extract a concise rule and decide whether "
-            "it belongs in global CLAUDE.md or project CLAUDE.md._\n\n"
-        )
+
+        if auto:
+            f.write(
+                "_For each message below, classify by signal type (CORRECTION, "
+                "PRINCIPLE, FEEDBACK, PATTERN, REPETITION, YAGNI, TASK, QUESTION), "
+                "then for norm candidates extract a concise rule, decide global vs "
+                "project CLAUDE.md placement, and apply the update. Skip messages "
+                "unrelated to coding norms. Do NOT pause — process all messages in "
+                "sequence without waiting for confirmation._\n\n"
+            )
+        else:
+            f.write(
+                "_Analyze each message below. Classify by signal type: CORRECTION, "
+                "PRINCIPLE, FEEDBACK, PATTERN, REPETITION, YAGNI, TASK, QUESTION. "
+                "Skip messages that are unrelated to coding norms. "
+                "For each norm candidate, extract a concise rule and decide whether "
+                "it belongs in global CLAUDE.md or project CLAUDE.md._\n\n"
+            )
+
         for i, (t, _, _) in enumerate(messages, 1):
             sessions = text_to_sessions[t]
             ss = f" [across {len(sessions)} sessions]" if len(sessions) > 1 else ""
@@ -374,13 +467,24 @@ def main():
         "--cluster-threshold",
         type=float,
         default=0.45,
-        help="Jaccard similarity threshold for clustering (0–1, default: 0.45)",
+        help="Similarity threshold for clustering (0–1, default: 0.45)",
+    )
+    parser.add_argument(
+        "--cluster-engine",
+        choices=["jaccard", "embedding"],
+        default="jaccard",
+        help="Clustering engine: jaccard (default) or embedding (requires sentence-transformers)",
     )
     parser.add_argument(
         "--days",
         type=int,
         default=0,
         help="Only process conversations from the last N days (0 = unlimited; 7/14/30 for cron)",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Auto mode: add AUTO marker and structured prompt so LLM proceeds without pausing",
     )
     parser.add_argument(
         "--verbose",
@@ -394,6 +498,18 @@ def main():
     if not project.is_dir():
         print(f"Error: not a directory: {project}", file=sys.stderr)
         sys.exit(1)
+
+    # Validate embedding engine availability early.
+    if args.cluster_engine == "embedding":
+        try:
+            import sentence_transformers  # noqa: F401
+        except ImportError:
+            print(
+                "Error: --cluster-engine embedding requires sentence-transformers. "
+                "Install with: pip install sentence-transformers",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     slug = str(project).replace("/", "-")
     logs_dir = Path.home() / ".claude/projects" / slug
@@ -447,6 +563,8 @@ def main():
         now,
         unique_msgs,
         cluster_threshold=args.cluster_threshold,
+        cluster_engine=args.cluster_engine,
+        auto=args.auto,
     )
     save_state(state_file, now)
 

@@ -1,88 +1,91 @@
-# Claude Norms Update
+# Claude Summarize
 
-从 Claude Code 聊天记录中自动提取开发规范，比对并更新 CLAUDE.md。
+Automatically extract development norms from Claude Code chat history, deduplicate against existing CLAUDE.md, and append new rules — cross-session learning for your AI coding assistant.
 
-## 原理
+## How It Works
 
-每次开发者与 Claude Code 对话时，会自然表达编码规范：纠正、原则、反馈、重复诉求。该工具从聊天记录 JSONL 中提取这些信号，聚类去重，交由 LLM 分析后追加到 CLAUDE.md，实现「跨会话学习」。
+As developers converse with Claude Code, they naturally express coding conventions: corrections, principles, feedback, and repeated requests. This tool extracts those signals from JSONL chat logs, clusters semantically similar messages, scores their "norm potential," and produces a structured digest for LLM analysis. The LLM then compares findings against existing CLAUDE.md files and appends new norms.
 
-## 特性
+## Features
 
-- **自动提取** — 扫描 Claude Code JSONL 聊天日志，过滤系统噪音
-- **语义聚类** — 基于 Jaccard 相似度（零外部依赖）聚合相近消息
-- **信号评分** — 自动标注 CORRECTION / PRINCIPLE / FEEDBACK / YAGNI 等类型并打分
-- **增量处理** — 状态文件追踪已处理会话，仅分析新增
-- **跨会话跟踪** — 标记跨多个会话出现的重复诉求
+- **Signal Scoring** — classifies each message as CORRECTION / PRINCIPLE / FEEDBACK / YAGNI / REPETITION / TASK / QUESTION with a weighted score
+- **Semantic Clustering** — groups near-duplicate messages via Jaccard word-set similarity (zero external dependencies)
+- **Cross-Session Tracking** — flags concerns that appear across multiple chat sessions
+- **Incremental Processing** — state file tracks already-processed sessions; only new logs are analyzed
+- **Time Window Filter** — `--days` flag limits analysis to recent conversations, ideal for cron jobs
 
-## 快速开始
+## Quick Start
 
-### 前提
+### Prerequisites
 
-- Claude Code 环境（聊天日志位于 `~/.claude/projects/`）
+- Claude Code environment (chat logs at `~/.claude/projects/`)
 - Python 3.8+
 
-### 用法
+### Usage
 
 ```bash
-# 提取指定项目的聊天规范
+# Extract norms from a project's chat history
 python3 extract_chat_norms.py /path/to/your/project
 
-# 调整聚类灵敏度
+# Limit to last 7 days of conversations (recommended for cron)
+python3 extract_chat_norms.py /path/to/your/project --days 7
+
+# Adjust clustering sensitivity
 python3 extract_chat_norms.py /path/to/your/project --cluster-threshold 0.5
 
-# 详细输出
+# Verbose output
 python3 extract_chat_norms.py /path/to/your/project -v
 ```
 
-输出文件：
-- `.norm_digest.md` — 结构化的消息摘要（热点聚类 + 信号评分表 + 完整正文）
-- `.norm_extractor_state.json` — 增量处理状态
+Output files:
+- `.norm_digest.md` — structured digest (hot topic clusters + signal score table + full message text)
+- `.norm_extractor_state.json` — incremental processing state
 
-### 完整流程（作为 Claude Code Skill）
+### Full Workflow (as a Claude Code Skill)
 
-1. 将本仓库作为 Skill 注册到 Claude Code
-2. 在项目中运行 `/norms` 或「提炼规范」
-3. LLM 自动分析 `.norm_digest.md`，比对现有 CLAUDE.md，追加新规范
+1. Register this repo as a Skill in Claude Code
+2. Run `/norms` or say "提炼规范" in your project
+3. The LLM analyzes `.norm_digest.md`, compares against CLAUDE.md, and appends new rules
 
-## 输出示例
+## Sample Digest Output
 
 ```
 # Chat Norms Digest — 2026-05-20 07:04
 
 **48** unique messages from **15** sessions
 
-## 🔥 热点聚类
+## 🔥 Hot Topic Clusters
 
-### 聚类 1（3 条，平均信号强度 2.8）
-- 配置方面的问题… [横跨 2 个会话]
-- 现在有重复的配置…
+### Cluster 1 (3 messages, avg signal 2.8)
+- Config duplication keeps causing issues… [across 2 sessions]
+- Multiple YAML files define the same retry settings…
 
-## 📋 消息明细（按信号强度排序）
-| # | 信号 | 强度 | 消息 | 会话数 |
-|---|------|------|------|--------|
-| 1 | CORRECTION | 3.0 | 不要用位置索引取数据… | 1 |
+## 📋 Messages by Signal Strength
+| # | Signal | Score | Message | Sessions |
+|---|--------|-------|---------|----------|
+| 1 | CORRECTION | 3.0 | Don't use positional index to match source data… | 2 |
 ```
 
-## 参数说明
+## Options
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `project_dir` | — | 项目目录路径 |
-| `--days` | 0 | 仅处理最近 N 天内对话（0=不限制，定时运行建议 7/14/30） |
-| `--cluster-threshold` | 0.45 | Jaccard 聚类阈值（0~1） |
-| `--min-length` | 15 | 最小消息长度 |
-| `--max-length` | 2000 | 最大消息长度 |
-| `-v` | — | 详细输出 |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `project_dir` | — | Project directory path |
+| `--days` | 0 | Only process conversations from last N days (0=unlimited; 7/14/30 recommended for cron) |
+| `--cluster-threshold` | 0.45 | Jaccard similarity threshold for clustering (0–1) |
+| `--min-length` | 15 | Minimum message length to include |
+| `--max-length` | 2000 | Maximum message length to include |
+| `-v` | — | Verbose output to stderr |
 
-## 架构
+## Architecture
 
 ```
-聊天日志 JSONL          .norm_digest.md          CLAUDE.md
-  │                          │                       ▲
-  ▼                          ▼                       │
-[提取脚本] ──▶ 聚类 + 评分 ──▶ [LLM 分析] ──▶ 去重写入
-                无外部依赖       语义理解         追加到全局/项目
-                增量追踪                           ↕ 无冗余
+Chat Logs (JSONL)         .norm_digest.md           CLAUDE.md
+  │                           │                        ▲
+  ▼                           ▼                        │
+[extract script] ──▶ cluster + score ──▶ [LLM analysis] ──▶ deduplicate + write
+                    zero-dependency        semantic check        global / project
+                    incremental tracking                         no redundancy
 ```
 
 ## License

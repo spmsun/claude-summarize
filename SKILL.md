@@ -14,24 +14,38 @@ Extract development norms from Claude Code chat logs and update CLAUDE.md.
 "提炼规范", "更新 CLAUDE.md", "回顾聊天", "总结规范",
 "cross-session learning", "/norms", "claude-summarize".
 
+## CLI Reference
+
+```
+python3 {baseDir}/extract_chat_norms.py <project_dir> [options]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--days N` | `0` (unlimited) | Only process last N days (7/14/30 for cron) |
+| `--cluster-threshold T` | `0.45` | Jaccard or cosine similarity threshold (0–1) |
+| `--cluster-engine E` | `jaccard` | `jaccard` (zero-deps) or `embedding` (cross-language, needs `sentence-transformers`) |
+| `--auto` | off | Auto mode — digest includes proceed-without-pausing instruction |
+| `--min-length N` | `15` | Minimum message length |
+| `--max-length N` | `2000` | Maximum message length |
+| `-v` | off | Verbose progress output |
+
 ## Workflow
 
 ### Step 1: Extract
 
 ```
-python3 {baseDir}/extract_chat_norms.py <project_dir>
+python3 {baseDir}/extract_chat_norms.py <project_dir> [--days 7] [--auto] [--cluster-engine jaccard|embedding]
 ```
 
-Options:
-- `--days 7` — only process conversations from last N days (0=unlimited; 7/14/30 for cron)
-- `--cluster-threshold 0.45` — Jaccard similarity threshold (0–1, default 0.45)
-- `--min-length 15` / `--max-length 2000` — message length bounds
-- `-v` — verbose progress output
-
 Output `<project>/.norm_digest.md`:
-- **Hot Topic Clusters** — semantically similar messages grouped (Jaccard word-set clustering), with cross-session occurrence counts
+- **Hot Topic Clusters** — semantically similar messages grouped (Jaccard or embedding clustering), with cross-session occurrence counts
 - **All Messages** — remaining singletons sorted by cross-session frequency
 - **Full Message Text** — complete text for LLM analysis
+
+**Clustering engines:**
+- `jaccard` (default): Zero-dependency word-set overlap. Fast, works for same-language messages. Fails to cluster "别吞异常" with "don't swallow exceptions".
+- `embedding`: Uses `all-MiniLM-L6-v2` via `sentence-transformers`. Cosine similarity on multilingual embeddings clusters cross-language messages correctly. Lazy-imported — no dependency unless actually used.
 
 ### Step 2: Analyze
 
@@ -51,10 +65,40 @@ Classify each message:
 
 **Ignore messages unrelated to coding norms** (office politics, random chat, project-specific one-off tasks).
 
-Cross-reference candidate norms against CLAUDE.md (global `~/.claude/CLAUDE.md` first, then project `<project>/CLAUDE.md`):
-- Already present → skip
-- Missing → proceed to Step 3
-- Conflict → flag and ask user
+#### Rule Conflict Detection
+
+**Before writing any new norm**, check it against ALL existing rules in both CLAUDE.md files:
+
+1. **Direct contradiction**: New rule says "always do X", existing rule says "never do X" → **HALT, report conflict** with both rules quoted verbatim, do NOT write either
+2. **Semantic overlap — narrower**: New rule is subset of existing → skip (existing covers it)
+3. **Semantic overlap — broader**: New rule subsumes existing → replace existing with broader rule
+4. **Tension**: Two rules pull in opposite directions (e.g., "inline everything" vs "DRY above all") → flag as tension, write the more specific one, add `> ⚠️ TENSION` comment above it in CLAUDE.md
+
+**Conflict report format** (when unresolvable):
+```
+> ⚠️ RULE CONFLICT DETECTED — manual resolution needed
+> New candidate: "<new rule>"
+> Conflicts with (global|project): "<existing rule>"
+> Reason: <one-line explanation of the contradiction>
+```
+
+#### Source Tracing
+
+When a norm is accepted and written to CLAUDE.md, record its provenance in `<project>/.norm_sources.json`:
+
+```json
+{
+  "norms": {
+    "严禁吞噬异常": {
+      "derived_from": ["2026-05-20 session: social_wechat 吞异常（20+ 处）"],
+      "written_at": "2026-05-20T07:04:00",
+      "type": "CORRECTION"
+    }
+  }
+}
+```
+
+This keeps CLAUDE.md clean (no source bloat) while preserving traceability. LLM reads `.norm_sources.json` only when auditing norms, not on every session load.
 
 ### Step 3: Refine
 
@@ -68,18 +112,61 @@ Consolidate before writing:
 - **Global / universal** (naming, DRY/KISS, error handling, etc.) → `~/.claude/CLAUDE.md`
 - **Project-specific** (ORM, scraper architecture, table schemas, etc.) → `<project>/CLAUDE.md`
 
+After writing, append source entries to `<project>/.norm_sources.json`.
+
 No new norms → output "No new norms this run."
+
+### Auto Mode
+
+When digest header contains `> AUTO` (from `--auto` flag):
+
+**Proceed through ALL steps without pausing for confirmation.** The digest includes explicit structured instructions. After analysis:
+1. Classify every message
+2. Run conflict detection on all candidates
+3. Refine and merge equivalents
+4. Write new norms directly to the appropriate CLAUDE.md
+5. Update `.norm_sources.json` with provenance
+6. Output a change summary: "Added N norms to global, M to project. K conflicts skipped."
+
+Auto mode is designed for cron/loop invocation:
+```
+/loop daily at 7:17 run claude-summarize --auto --days 1
+```
+
+## Compliance Verification
+
+```
+python3 {baseDir}/verify_norms.py <project_dir> [--severity HIGH|MEDIUM|LOW|ALL] [-v]
+```
+
+Scans project code against CLAUDE.md rules and outputs `<project>/.norm_compliance.md`.
+
+| Rule | Method | Severity |
+|---|---|---|
+| 严禁吞噬异常 | grep `except\s+.*:\s*pass` | HIGH |
+| `_count` → `_cnt` | grep `_count\b` (skip `_cnt`) | MEDIUM |
+| 中文标识用 `cn` 不用 `zh` | grep `"zh"` / `'zh'` in lang fields | LOW |
+| 爬虫 `.py` + `.yaml` 配对 | glob check in `crawler/spiders/` | MEDIUM |
+| JSON 字段用 Text | grep `Column.*JSON` | HIGH |
+| 禁止二次包皮 | AST: 1-line body that only delegates | MEDIUM |
+| 禁止同名目录嵌套 | check dir name duplication across depths | LOW |
+| url 优先用 url_hash | find `url` columns without matching `url_hash` | LOW |
+| 空 `__init__.py` | find `__init__.py` with only comments | LOW |
 
 ## Rules
 
 - Multi-part requirements ("scan all references", "sync everywhere") → single rule, never split
 - Extraction script runs silently; only output a change summary when new norms are found
-- Suggested cron: `/loop daily at 7:17 run claude-summarize`
+- Before writing any norm, run conflict detection against BOTH CLAUDE.md files
+- Source tracing goes to `.norm_sources.json`, NOT into CLAUDE.md
+- Suggested cron: `/loop daily at 7:17 run claude-summarize --auto --days 1`
 
 ## Sample Output
 
 ```
 # Chat Norms Digest — 2026-05-20 07:04
+
+> AUTO
 
 **48** unique messages from **15** sessions
 
