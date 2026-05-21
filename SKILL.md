@@ -136,22 +136,12 @@ Auto mode is designed for cron/loop invocation:
 ## Compliance Verification
 
 ```
-python3 {baseDir}/verify_norms.py <project_dir> [--severity HIGH|MEDIUM|LOW|ALL] [-v]
+python3 {baseDir}/verify_norms.py <project_dir> [--stdout]
 ```
 
-Scans project code against CLAUDE.md rules and outputs `<project>/.norm_compliance.md`.
+Generates `<project>/.norm_check_prompt.md` — a single prompt that bundles CLAUDE.md rules + project file listing. **No grep, no AST, no hardcoded checks.** The LLM reads the prompt, understands the rules, scans the project, and writes `<project>/.norm_compliance.md`.
 
-| Rule | Method | Severity |
-|---|---|---|
-| 严禁吞噬异常 | grep `except\s+.*:\s*pass` | HIGH |
-| `_count` → `_cnt` | grep `_count\b` (skip `_cnt`) | MEDIUM |
-| 中文标识用 `cn` 不用 `zh` | grep `"zh"` / `'zh'` in lang fields | LOW |
-| 爬虫 `.py` + `.yaml` 配对 | glob check in `crawler/spiders/` | MEDIUM |
-| JSON 字段用 Text | grep `Column.*JSON` | HIGH |
-| 禁止二次包皮 | AST: 1-line body that only delegates | MEDIUM |
-| 禁止同名目录嵌套 | check dir name duplication across depths | LOW |
-| url 优先用 url_hash | find `url` columns without matching `url_hash` | LOW |
-| 空 `__init__.py` | find `__init__.py` with only comments | LOW |
+To run a compliance check, invoke `verify_norms.py` then feed the resulting prompt to the LLM for analysis. In auto mode this is part of the end-to-end pipeline.
 
 ## Rules
 
