@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-合规检查 — 读取 CLAUDE.md 规范，生成 LLM 审查提示词。
+Compliance verification — reads CLAUDE.md rules, generates an LLM review prompt.
 
-不内置任何检查逻辑。读取规范 → 扫描项目结构 → 输出一句提示词，
-LLM 自行阅读理解规范、逐文件审查、输出分级违规报告。
+No built-in check logic. Reads specs → scans project tree → outputs a single prompt.
+The LLM reads the rules, understands them, scans project files, and writes the report.
 """
 
 import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-
-CST = timezone(timedelta(hours=8))
 
 SKIP_DIRS = {
     ".git",
@@ -29,25 +27,25 @@ SKIP_DIRS = {
     "user_data",
 }
 
-PROMPT = """读取以下 CLAUDE.md 编码规范，然后扫描项目文件，逐条检查规范遵守情况，输出分级违规报告。
+PROMPT = """Review the CLAUDE.md coding standards below. Then scan the project files and check each rule for compliance violations. Produce a severity-graded report.
 
-## 规范文件
+## Standards
 
 {specs}
 
-## 项目文件清单
+## Project Files
 
 {files}
 
-## 执行要求
+## Instructions
 
-对每一条规范，在项目文件中查找违规情况。按严重程度（HIGH / MEDIUM / LOW）分级报告：
+For each rule in the standards, search the project files for violations. Report by severity (HIGH / MEDIUM / LOW):
 
 ```
 # Norm Compliance Report — {timestamp}
 
 ## HIGH Severity
-- `file.py:42` — 违规描述（引用具体规范原文）
+- `file.py:42` — violation description (quote the specific rule)
 
 ## MEDIUM Severity
 - ...
@@ -56,48 +54,53 @@ PROMPT = """读取以下 CLAUDE.md 编码规范，然后扫描项目文件，逐
 - ...
 ```
 
-规则：
-- HIGH = 明确禁止的行为（吞异常、JSON字段类型错误等）
-- MEDIUM = 命名/结构规范违反
-- LOW = 风格建议未遵守
-- 仅报告实际发现的违规，规范全部遵守则写"未发现违规"
-- 按文件路径排序，每条引用规范原文
-- 输出保存到 `<project>/.norm_compliance.md`
+Severity guidelines:
+- HIGH = explicitly forbidden behavior (swallowed exceptions, wrong column types, etc.)
+- MEDIUM = naming / structural rule violations
+- LOW = style suggestions not followed
+- Only report actual violations found. If a rule is fully complied with, skip it.
+- Sort by file path. Quote the specific rule text for each violation.
+- Write output to `<project>/.norm_compliance.md`
 """
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成合规审查提示词")
+    parser = argparse.ArgumentParser(
+        description="Generate a compliance review prompt from CLAUDE.md"
+    )
     parser.add_argument(
-        "project_dir", nargs="?", default=".", help="项目根目录路径（默认: 当前目录）"
+        "project_dir",
+        nargs="?",
+        default=".",
+        help="Project root directory (default: current)",
     )
     parser.add_argument(
         "-o",
         "--output",
         default=None,
-        help="提示词输出路径（默认: <project>/.norm_check_prompt.md）",
+        help="Prompt output path (default: <project>/.norm_check_prompt.md)",
     )
-    parser.add_argument("--stdout", action="store_true", help="输出提示词到终端")
+    parser.add_argument("--stdout", action="store_true", help="Print prompt to stdout")
     args = parser.parse_args()
 
     project = Path(args.project_dir).resolve()
     if not project.is_dir():
-        print(f"错误: 目录不存在: {project}", file=__import__("sys").stderr)
+        print(f"Error: not a directory: {project}", file=__import__("sys").stderr)
         raise SystemExit(1)
 
-    # 收集规范
+    # Collect standards
     spec_parts = []
     for label, path in [
-        ("全局规范", Path.home() / ".claude" / "CLAUDE.md"),
-        ("项目规范", project / "CLAUDE.md"),
+        ("Global", Path.home() / ".claude" / "CLAUDE.md"),
+        ("Project", project / "CLAUDE.md"),
     ]:
         if path.exists():
             spec_parts.append(
                 f"### {label}\n\n{path.read_text(encoding='utf-8', errors='replace')}"
             )
-    specs = "\n\n---\n\n".join(spec_parts) if spec_parts else "(未找到 CLAUDE.md)"
+    specs = "\n\n---\n\n".join(spec_parts) if spec_parts else "(no CLAUDE.md found)"
 
-    # 扫描项目文件
+    # Scan project files
     file_lines = []
     for f in sorted(project.rglob("*")):
         if set(f.parts).intersection(SKIP_DIRS):
@@ -111,14 +114,14 @@ def main():
 
     files = "\n".join(file_lines[:500])
 
-    now = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S CST")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     prompt = PROMPT.format(specs=specs, files=files, timestamp=now)
 
     output_path = (
         Path(args.output) if args.output else (project / ".norm_check_prompt.md")
     )
     output_path.write_text(prompt, encoding="utf-8")
-    print(f"提示词已写入: {output_path}", file=__import__("sys").stderr)
+    print(f"Prompt written: {output_path}", file=__import__("sys").stderr)
 
     if args.stdout:
         print(prompt)
